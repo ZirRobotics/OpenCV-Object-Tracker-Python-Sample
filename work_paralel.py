@@ -14,6 +14,7 @@ import numpy as np
 from ultralytics import YOLO
 
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,  # Set to DEBUG to capture all levels of logs
@@ -219,14 +220,14 @@ def main():
 
     # Queues for inter-thread communication ##################################
     frame_queue = queue.Queue(maxsize=1)
-    detection_queue = queue.Queue(maxsize=1)
+    detection_queue = queue.Queue(maxsize=5)
     stop_event = threading.Event()
 
     # Detection Thread ########################################################
     def detection_worker():
         while not stop_event.is_set():
             try:
-                frame = frame_queue.get(timeout=1)
+                frame = frame_queue.get(timeout=0.01)
                 logging.debug("Frame retrieved from frame_queue for detection.")
                 detect_objects(model, frame, detection_queue)
                 logging.debug("Object detection completed and results put into detection_queue.")
@@ -257,7 +258,7 @@ def main():
 
             # Put the frame into the frame_queue for detection
             if not frame_queue.full():
-                frame_queue.put(image)
+                frame_queue.put(image, timeout=0.01)
                 logging.debug("Frame added to frame_queue.")
             else:
                 logging.debug("Frame queue is full. Skipping frame.")
