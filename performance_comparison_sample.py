@@ -28,6 +28,8 @@ def get_args():
     parser.add_argument('--use_nano', action='store_true')
     parser.add_argument('--use_vit', action='store_true')
 
+    parser.add_argument('--use_yolo', action='store_true', help='Use YOLO for object detection')
+
     args = parser.parse_args()
 
     return args
