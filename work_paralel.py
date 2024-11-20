@@ -210,6 +210,7 @@ def main():
     # Load YOLOv8 model ######################################################
     try:
         model_path = r"D:\pycharm_projects\yolov8\runs\detect\drone_v9_300ep_32bath\weights\best.pt"
+        # model_path = "yolo11m.pt"
         model = YOLO(model_path, task='detect')  # Ensure you have the correct path to your YOLOv8 model
         logging.info(f"YOLOv8 model loaded from {model_path}.")
     except Exception as e:

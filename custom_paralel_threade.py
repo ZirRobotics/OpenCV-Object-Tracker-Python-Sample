@@ -8,7 +8,8 @@ import argparse
 import threading
 import queue
 import logging
-from collections import deque
+from threading import Thread
+import os  # Optional, for file path handling if needed
 
 import cv2 as cv
 import numpy as np
@@ -25,35 +26,32 @@ logging.basicConfig(
 )
 
 def get_args():
-    parser = argparse.ArgumentParser(description="Single Object Tracker with YOLOv8 Detection")
+    parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", default="sample_movie/bird.mp4",
-                        help="Video source. Can be a video file path or a camera index (integer).")
-    parser.add_argument("--width", help='Capture width', type=int, default=960)
-    parser.add_argument("--height", help='Capture height', type=int, default=540)
+    parser.add_argument("--device", default="sample_movie/bird.mp4")
+    parser.add_argument("--width", help='cap width', type=int, default=1280)
+    parser.add_argument("--height", help='cap height', type=int, default=720)
 
-    # Single tracker selection using mutually exclusive group
-    tracker_group = parser.add_mutually_exclusive_group()
-    tracker_group.add_argument('--mil', action='store_true', help='Use MIL tracker')
-    tracker_group.add_argument('--goturn', action='store_true', help='Use GOTURN tracker')
-    tracker_group.add_argument('--dasiamrpn', action='store_true', help='Use DaSiamRPN tracker')
-    tracker_group.add_argument('--nano', action='store_true', help='Use Nano tracker')
-    tracker_group.add_argument('--vit', action='store_true', help='Use ViT tracker')
-    tracker_group.add_argument('--csrt', action='store_true', help='Use CSRT tracker')
-    tracker_group.add_argument('--kcf', action='store_true', help='Use KCF tracker')
-    tracker_group.add_argument('--boosting', action='store_true', help='Use Boosting tracker')
-    tracker_group.add_argument('--mosse', action='store_true', help='Use MOSSE tracker')
-    tracker_group.add_argument('--medianflow', action='store_true', help='Use MedianFlow tracker')
-    tracker_group.add_argument('--tld', action='store_true', help='Use TLD tracker')
+    parser.add_argument('--use_mil', action='store_true')
+    parser.add_argument('--use_goturn', action='store_true')
+    parser.add_argument('--use_dasiamrpn', action='store_true')
+    parser.add_argument('--use_csrt', action='store_true')
+    parser.add_argument('--use_kcf', action='store_true')
+    parser.add_argument('--use_boosting', action='store_true')
+    parser.add_argument('--use_mosse', action='store_true')
+    parser.add_argument('--use_medianflow', action='store_true')
+    parser.add_argument('--use_tld', action='store_true')
+    parser.add_argument('--use_nano', action='store_true')
+    parser.add_argument('--use_vit', action='store_true')
 
     args = parser.parse_args()
-    logging.debug(f"Parsed arguments: {args}")
+    logging.debug(f"Parsed arg: {args}")
 
     return args
 
 def isint(s):
-    p = '[-+]?\d+'
-    logging.debug(f"Checking if '{s}' is an integer.")
+    p = r'[-+]?\d+'
+    logging.debug(f"Checking if {s} is integer.")
     return True if re.fullmatch(p, s) else False
 
 def detect_objects(model, frame, detection_queue):
@@ -72,110 +70,65 @@ def detect_objects(model, frame, detection_queue):
     except Exception as e:
         logging.error(f"Error during object detection: {e}")
 
-class TrackerInfo:
-    """
-    A class to hold a single tracker and its bounding box history for smoothing.
-    """
-    def __init__(self, tracker, algorithm, initial_bbox, history_size=5):
-        self.tracker = tracker
-        self.algorithm = algorithm
-        self.bbox_history = deque(maxlen=history_size)
-        self.bbox_history.append(initial_bbox)
-        self.color = None  # To be assigned later
+def initialize_tracker_list(image, detected_bboxes, scale_factor, large_object_threshold):
+    tracker_list = []
 
-    def update(self, frame):
-        """
-        Update the tracker with the current frame and store bbox.
-        Returns the smoothed bbox and tracking status.
-        """
-        ok, bbox = self.tracker.update(frame)
-        if ok:
-            # Convert bbox to int and store
-            bbox = [int(b) for b in bbox]
-            self.bbox_history.append(bbox)
-            # Calculate smoothed bbox
-            smoothed_bbox = self.get_smoothed_bbox()
-            return smoothed_bbox, True
+    # Scale the image for tracking
+    scaled_image = cv.resize(image, None, fx=scale_factor, fy=scale_factor, interpolation=cv.INTER_LINEAR)
+
+    # Tracker list generation
+    for bbox in detected_bboxes:
+        # Scale the bounding box
+        x, y, w, h = bbox
+        scaled_bbox = (int(x * scale_factor), int(y * scale_factor), int(w * scale_factor), int(h * scale_factor))
+        w_scaled, h_scaled = scaled_bbox[2], scaled_bbox[3]
+        area = w_scaled * h_scaled
+
+        # Decide which tracker to use based on the area
+        if area > large_object_threshold:
+            tracker_algorithm = 'KCF'
         else:
-            return None, False
+            tracker_algorithm = 'Nano'
 
-    def get_smoothed_bbox(self):
-        """
-        Calculate the moving average of the bounding boxes.
-        """
-        avg_bbox = np.mean(self.bbox_history, axis=0)
-        return [int(coord) for coord in avg_bbox]
+        tracker = None
+        logging.debug(f"Initializing tracker '{tracker_algorithm}' with bbox: {scaled_bbox}")
 
-def initialize_tracker(image, tracker_algorithm, initial_bbox):
-    """
-    Initialize a single tracker based on the specified algorithm and return TrackerInfo.
-    """
-    tracker = None
-    logging.debug(f"Initializing tracker '{tracker_algorithm}'.")
+        if tracker_algorithm == 'Nano':
+            params = cv.TrackerNano_Params()
+            params.backbone = "model/nanotrackv2/nanotrack_backbone_sim.onnx"
+            params.neckhead = "model/nanotrackv2/nanotrack_head_sim.onnx"
+            tracker = cv.TrackerNano_create(params)
+        elif tracker_algorithm == 'KCF':
+            tracker = cv.TrackerKCF_create()
+        else:
+            logging.warning(f"Unknown tracker algorithm: {tracker_algorithm}")
 
-    if tracker_algorithm == 'MIL':
-        tracker = cv.TrackerMIL_create()
-    elif tracker_algorithm == 'GOTURN':
-        params = cv.TrackerGOTURN_Params()
-        params.modelTxt = "model/GOTURN/goturn.prototxt"
-        params.modelBin = "model/GOTURN/goturn.caffemodel"
-        tracker = cv.TrackerGOTURN_create(params)
-    elif tracker_algorithm == 'DaSiamRPN':
-        params = cv.TrackerDaSiamRPN_Params()
-        params.model = "model/DaSiamRPN/dasiamrpn_model.onnx"
-        params.kernel_r1 = "model/DaSiamRPN/dasiamrpn_kernel_r1.onnx"
-        params.kernel_cls1 = "model/DaSiamRPN/dasiamrpn_kernel_cls1.onnx"
-        tracker = cv.TrackerDaSiamRPN_create(params)
-    elif tracker_algorithm == 'Nano':
-        params = cv.TrackerNano_Params()
-        params.backbone = "model/nanotrackv2/nanotrack_backbone_sim.onnx"
-        params.neckhead = "model/nanotrackv2/nanotrack_head_sim.onnx"
-        tracker = cv.TrackerNano_create(params)
-    elif tracker_algorithm == 'Vit':
-        params = cv.TrackerVit_Params()
-        params.net = "model/vit/object_tracking_vittrack_2023sep.onnx"
-        tracker = cv.TrackerVit_create(params)
-    elif tracker_algorithm == 'CSRT':
-        tracker = cv.TrackerCSRT_create()
-    elif tracker_algorithm == 'KCF':
-        tracker = cv.TrackerKCF_create()
-    elif tracker_algorithm == 'Boosting':
-        tracker = cv.legacy_TrackerBoosting.create()
-    elif tracker_algorithm == 'MOSSE':
-        tracker = cv.legacy_TrackerMOSSE.create()
-    elif tracker_algorithm == 'MedianFlow':
-        tracker = cv.legacy_TrackerMedianFlow.create()
-    elif tracker_algorithm == 'TLD':
-        tracker = cv.legacy_TrackerTLD.create()
-    else:
-        logging.warning(f"Unknown tracker algorithm: {tracker_algorithm}")
-        return None
+        if tracker is not None:
+            try:
+                tracker.init(scaled_image, scaled_bbox)
+                tracker_list.append((tracker, tracker_algorithm, scaled_bbox))
+                logging.debug(f"Successfully initialized '{tracker_algorithm}' tracker with bbox: {scaled_bbox}")
+            except Exception as e:
+                logging.error(f"Exception during tracker initialization for '{tracker_algorithm}' with bbox {scaled_bbox}: {e}")
+        else:
+            logging.error(f"Failed to initialize '{tracker_algorithm}' tracker with bbox: {scaled_bbox}")
 
-    if tracker is not None:
-        try:
-            tracker.init(image, tuple(initial_bbox))
-            tracker_info = TrackerInfo(tracker, tracker_algorithm, initial_bbox)
-            logging.debug(f"Successfully initialized '{tracker_algorithm}' tracker with bbox: {initial_bbox}")
-            return tracker_info
-        except Exception as e:
-            logging.error(f"Exception during tracker initialization for '{tracker_algorithm}' with bbox {initial_bbox}: {e}")
-            return None
-    else:
-        logging.error(f"Failed to initialize '{tracker_algorithm}' tracker with bbox: {initial_bbox}")
-        return None
+    logging.info(f"Total trackers initialized: {len(tracker_list)}")
+    return tracker_list
 
 def main():
     color_list = [
-        [255, 0, 0],      # Blue
-        [0, 255, 0],      # Green
-        [0, 0, 255],      # Red
-        [255, 255, 0],    # Cyan
-        [255, 0, 255],    # Magenta
-        [0, 255, 255],    # Yellow
-        [128, 0, 128],    # Purple
-        [128, 128, 0],    # Olive
-        [0, 128, 128],    # Teal
-        [128, 0, 0],      # Maroon
+        [255, 0, 0],     # blue
+        [255, 255, 0],   # aqua
+        [0, 255, 0],     # lime
+        [128, 0, 128],   # purple
+        [0, 0, 255],     # red
+        [255, 0, 255],   # fuchsia
+        [0, 128, 0],     # green
+        [128, 128, 0],   # teal
+        [0, 0, 128],     # maroon
+        [0, 128, 128],   # olive
+        [0, 255, 255],   # yellow
     ]
 
     # Parse arguments ########################################################
@@ -185,33 +138,9 @@ def main():
     cap_width = args.width
     cap_height = args.height
 
-    # Determine selected tracker algorithm
-    tracker_algorithm = 'CSRT'  # Default tracker
-    if args.mil:
-        tracker_algorithm = 'MIL'
-    elif args.goturn:
-        tracker_algorithm = 'GOTURN'
-    elif args.dasiamrpn:
-        tracker_algorithm = 'DaSiamRPN'
-    elif args.nano:
-        tracker_algorithm = 'Nano'
-    elif args.vit:
-        tracker_algorithm = 'Vit'
-    elif args.csrt:
-        tracker_algorithm = 'CSRT'
-    elif args.kcf:
-        tracker_algorithm = 'KCF'
-    elif args.boosting:
-        tracker_algorithm = 'Boosting'
-    elif args.mosse:
-        tracker_algorithm = 'MOSSE'
-    elif args.medianflow:
-        tracker_algorithm = 'MedianFlow'
-    elif args.tld:
-        tracker_algorithm = 'TLD'
-
-    logging.info(f"Selected Tracker Algorithm: {tracker_algorithm}")
-    print("Selected Tracker Algorithm:", tracker_algorithm)
+    # Set scale factor and large object threshold
+    scale_factor = 0.8  # Downscale by half
+    large_object_threshold = 5000  # Threshold area in scaled image
 
     # Camera setup ###########################################################
     if isint(cap_device):
@@ -226,16 +155,26 @@ def main():
 
     # Load YOLOv8 model ######################################################
     try:
+        # Adjust the path to your YOLOv8 model as needed
         model_path = r"D:\pycharm_projects\yolov8\runs\detect\drone_v9_300ep_32bath\weights\best.pt"
-        model = YOLO(model_path, task='detect')  # Ensure you have the correct path to your YOLOv8 model
+        model = YOLO(model_path, task='detect')
         logging.info(f"YOLOv8 model loaded from {model_path}.")
     except Exception as e:
         logging.error(f"Failed to load YOLOv8 model: {e}")
         sys.exit(1)
 
+    # Video Writer setup #####################################################
+    # output_video_path = 'output_video.mp4'  # Specify your desired output file path
+    # fourcc = cv.VideoWriter_fourcc(*'mp4v')  # Define the codec ('mp4v' for MP4 files)
+    output_width = 1920
+    output_height = 1080
+
+    # Initialize the VideoWriter object
+    # out = cv.VideoWriter(output_video_path, fourcc, fps, (output_width, output_height))
+
     # Queues for inter-thread communication ##################################
-    frame_queue = queue.Queue(maxsize=5)  # Increased maxsize to 5
-    detection_queue = queue.Queue(maxsize=5)
+    frame_queue = queue.Queue(maxsize=1)
+    detection_queue = queue.Queue(maxsize=1)
     stop_event = threading.Event()
 
     # Detection Thread ########################################################
@@ -259,10 +198,12 @@ def main():
     window_name = 'Tracker Demo'
     cv.namedWindow(window_name)
 
-    tracker_info = None  # Single TrackerInfo instance
+    tracker_list = []
     detected_bboxes = []
-    frame_count = 0
-    detection_interval = 5  # Perform detection every 5 frames
+
+    # Initialize FPS variables
+    prev_time = time.time()
+    fps = 0
 
     try:
         while cap.isOpened():
@@ -271,83 +212,150 @@ def main():
                 logging.info("No frame received. Exiting main loop.")
                 break
 
-            debug_image = copy.deepcopy(image)
-            frame_count += 1
+            # Calculate FPS
+            current_time = time.time()
+            frame_duration = current_time - prev_time
+            fps = 1.0 / frame_duration
+            prev_time = current_time
 
-            # Put the frame into the frame_queue for detection every detection_interval frames
-            if frame_count % detection_interval == 0:
-                if frame_queue.full():
-                    try:
-                        removed_frame = frame_queue.get_nowait()
-                        logging.debug("Frame queue is full. Removed oldest frame to add a new one.")
-                    except queue.Empty:
-                        logging.warning("Frame queue was full but no frame to remove.")
+            # Determine text position (top-right corner)
+            fps_text = f"FPS: {fps:.2f}"
+            text_size = cv.getTextSize(fps_text, cv.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+            text_x = image.shape[1] - text_size[0] - 10  # 10px padding from the right
+            text_y = 30  # 30px from the top
+
+            # Display FPS on the frame
+            cv.putText(image, fps_text, (text_x, text_y), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv.LINE_AA)
+
+            debug_image = copy.deepcopy(image)
+
+            # Put the frame into the frame_queue for detection
+            if not frame_queue.full():
                 frame_queue.put(image)
                 logging.debug("Frame added to frame_queue.")
             else:
-                logging.debug(f"Skipping detection for frame {frame_count}.")
+                logging.debug("Frame queue is full. Skipping frame.")
 
             # Retrieve detection results if available
             try:
                 detected_bboxes = detection_queue.get_nowait()
-                if detected_bboxes and tracker_info is None:
+                if detected_bboxes:
                     logging.debug(f"Retrieved {len(detected_bboxes)} bounding boxes from detection_queue.")
-                    # Initialize only the first detected bounding box
-                    initial_bbox = detected_bboxes[0]
-                    tracker_info = initialize_tracker(image, tracker_algorithm, initial_bbox)
-                    if tracker_info:
-                        # Assign a color
-                        tracker_info.color = color_list[0 % len(color_list)]
-                        logging.info(f"Initialized tracker '{tracker_algorithm}' with bbox: {initial_bbox}")
+                    tracker_list = initialize_tracker_list(image, detected_bboxes, scale_factor, large_object_threshold)
+                    logging.info(f"Initialized {len(tracker_list)} trackers based on detected bounding boxes.")
             except queue.Empty:
                 pass  # No new detections yet
 
-            if tracker_info:
-                smoothed_bbox, ok = tracker_info.update(image)
-                if ok and smoothed_bbox is not None:
-                    # Draw bounding box after smoothing
+            # Scale the image for tracking
+            scaled_image = cv.resize(image, None, fx=scale_factor, fy=scale_factor, interpolation=cv.INTER_LINEAR)
+
+            # Initialize lists to store results
+            elapsed_time_list = [None] * len(tracker_list)
+            tracker_scores = [None] * len(tracker_list)
+            ok_list = [None] * len(tracker_list)
+            bbox_list = [None] * len(tracker_list)
+            tracker_algorithms = [None] * len(tracker_list)
+
+            # Function to update a single tracker
+            def update_tracker(tracker_info, index, image):
+                tracker, tracker_algorithm, _ = tracker_info
+                start_time = time.time()
+                ok, bbox = tracker.update(image)
+                try:
+                    tracker_score = tracker.getTrackingScore()
+                except:
+                    tracker_score = '-'
+                elapsed_time = time.time() - start_time
+
+                # Store results in the lists
+                ok_list[index] = ok
+                bbox_list[index] = bbox
+                tracker_scores[index] = tracker_score
+                elapsed_time_list[index] = elapsed_time
+                tracker_algorithms[index] = tracker_algorithm
+
+            # Start threads for each tracker
+            threads = []
+            for index, tracker_info in enumerate(tracker_list):
+                t = Thread(target=update_tracker, args=(tracker_info, index, scaled_image))
+                threads.append(t)
+                t.start()
+
+            # Wait for all threads to finish
+            for t in threads:
+                t.join()
+
+            # Process the results
+            for index in range(len(tracker_list)):
+                ok = ok_list[index]
+                bbox = bbox_list[index]
+                tracker_score = tracker_scores[index]
+                elapsed_time = elapsed_time_list[index]
+                tracker_algorithm = tracker_algorithms[index]
+
+                if ok:
+                    # Scale bbox back to original size for display
+                    x, y, w, h = bbox
+                    x = int(x / scale_factor)
+                    y = int(y / scale_factor)
+                    w = int(w / scale_factor)
+                    h = int(h / scale_factor)
+                    new_bbox = [x, y, w, h]
+
+                    # Draw bounding box after tracking
                     cv.rectangle(debug_image,
-                                 (smoothed_bbox[0], smoothed_bbox[1]),
-                                 (smoothed_bbox[0] + smoothed_bbox[2], smoothed_bbox[1] + smoothed_bbox[3]),
-                                 tracker_info.color,
+                                 (new_bbox[0], new_bbox[1]),
+                                 (new_bbox[0] + new_bbox[2], new_bbox[1] + new_bbox[3]),
+                                 color_list[index % len(color_list)],
                                  thickness=2)
-                    logging.debug(f"Tracker ({tracker_info.algorithm}) updated successfully with smoothed bbox: {smoothed_bbox}")
+                    logging.debug(f"Tracker {index} ({tracker_algorithm}) updated successfully with bbox: {new_bbox}")
                 else:
-                    # If tracking fails, remove the tracker_info
-                    logging.warning(f"Tracker ({tracker_info.algorithm}) failed to update. Removing tracker.")
-                    tracker_info = None
+                    # If tracking fails, reset trackers
+                    logging.warning(f"Tracker {index} ({tracker_algorithm}) failed to update. Resetting all trackers.")
+                    tracker_list = []
+                    break
 
-            # Display processing time and inference speed
-            # Replace static text with dynamic measurements if desired
-            # For now, keeping it static as in the original code
-            cv.putText(
-                debug_image,
-                f"Speed: 1.0ms preprocess, 17.9ms inference, 11.0ms postprocess per image at shape (1, 3, 512, 640)",
-                (10, debug_image.shape[0] - 10),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 255),
-                1,
-                cv.LINE_AA
-            )
+            # Display processing time and tracker scores for each tracker
+            for index in range(len(tracker_list)):
+                tracker_algorithm = tracker_algorithms[index]
+                if index < len(elapsed_time_list):
+                    elapsed_time_ms = elapsed_time_list[index] * 1000
+                    if index < len(tracker_scores):
+                        score = tracker_scores[index]
+                        if score != '-':
+                            text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms Score:{score:.2f}"
+                        else:
+                            text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms"
+                    else:
+                        text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms"
+                else:
+                    text = f"{tracker_algorithm} : N/A"
 
-            cv.imshow(window_name, debug_image)
+                cv.putText(
+                    debug_image,
+                    text,
+                    (10, int(25 * (index + 1))),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color_list[index % len(color_list)],
+                    2,
+                    cv.LINE_AA
+                )
+
+            # Resize the debug_image to the desired output size
+            debug_image_resized = cv.resize(debug_image, (output_width, output_height))
+
+            # Write the resized frame to the output video
+            # out.write(debug_image_resized)
+
+            # Display the resized image
+            cv.imshow(window_name, debug_image_resized)
 
             k = cv.waitKey(1)
             if k == 32:  # SPACE
-                # Reinitialize tracker based on new selection
-                try:
-                    new_detections = detection_queue.get_nowait()
-                    if new_detections:
-                        detected_bboxes = new_detections
-                        # Reinitialize tracker with the first detected bounding box
-                        initial_bbox = detected_bboxes[0]
-                        tracker_info = initialize_tracker(image, tracker_algorithm, initial_bbox)
-                        if tracker_info:
-                            tracker_info.color = color_list[0 % len(color_list)]
-                            logging.info(f"Re-initialized tracker '{tracker_algorithm}' with bbox: {initial_bbox}")
-                except queue.Empty:
-                    logging.debug("No new detections available for reinitialization.")
+                # Reinitialize trackers based on new selection
+                detected_bboxes = detection_queue.get()
+                tracker_list = initialize_tracker_list(image, detected_bboxes, scale_factor, large_object_threshold)
             if k == 27:  # ESC
                 logging.info("ESC key pressed. Exiting.")
                 break
@@ -360,6 +368,7 @@ def main():
         stop_event.set()
         detection_thread.join(timeout=2)
         cap.release()
+        # out.release()  # Release the VideoWriter
         cv.destroyAllWindows()
         logging.info("Resources released and program terminated gracefully.")
 
