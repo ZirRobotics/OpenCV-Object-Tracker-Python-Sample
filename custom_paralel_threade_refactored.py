@@ -86,7 +86,12 @@ class ObjectDetector(threading.Thread):
             for result in results:
                 for box in result.boxes:
                     x1, y1, x2, y2 = box.xyxy[0]
-                    bboxes.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+                    w = int(x2 - x1)
+                    h = int(y2 - y1)
+                    if w > 0 and h > 0:
+                        bboxes.append((int(x1), int(y1), w, h))
+                    else:
+                        logging.warning(f"Detected invalid bounding box with zero area: {(x1, y1, w, h)}")
             logging.debug(f"Detected {len(bboxes)} bounding boxes.")
             return bboxes
         except Exception as e:
@@ -114,6 +119,12 @@ class TrackerFactory:
         Returns:
             dict or None: A dictionary containing tracker info or None if initialization fails.
         """
+        # Validate the bounding box
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            logging.error(f"Invalid bounding box with zero area: {bbox}. Cannot initialize tracker.")
+            return None
+
         tracker = None
         logging.debug(f"Initializing tracker '{algorithm}' with bbox: {bbox}")
 
@@ -200,9 +211,11 @@ class TrackerManager:
                 elif algorithm == 'Nano' and area >= upper_threshold:
                     logging.info(f"Switching tracker {idx} from Nano to KCF due to size increase.")
                     self.switch_tracker(tracker_info, scaled_image, 'KCF')
+
             except Exception as e:
                 logging.error(f"Exception in tracker {idx} ({algorithm}): {e}")
                 tracker_info['ok'] = False
+                self.trackers.remove(tracker_info)
 
         for idx, tracker_info in enumerate(self.trackers):
             tracker_info['index'] = idx
@@ -228,8 +241,10 @@ class TrackerManager:
             })
             logging.info(f"Tracker {idx} switched to {new_algorithm}.")
         else:
-            logging.error(f"Failed to switch tracker {idx} to {new_algorithm}.")
+            logging.error(f"Failed to switch tracker {idx} to {new_algorithm} due to invalid bbox. Removing tracker.")
+            # Remove the tracker since it cannot be initialized
             tracker_info['ok'] = False
+            self.trackers.remove(tracker_info)
 
     def reset_trackers(self):
         """Reset all trackers."""
@@ -290,6 +305,51 @@ def draw_fps(frame, prev_time, prev_fps):
     return prev_time, fps
 
 
+def is_bbox_touches_frame(bbox, frame_width, frame_height):
+    """
+    Check if any part of the bounding box is touches the frame boundaries.
+
+    Args:
+        bbox (list or tuple): Bounding box in the format [x, y, w, h].
+        frame_width (int): Width of the frame.
+        frame_height (int): Height of the frame.
+
+    Returns:
+        bool: True if any part of the bounding box is touches the frame, False otherwise.
+    """
+    x, y, w, h = bbox
+
+    # Check if bounding box is within frame boundaries
+    if x < 0 or y < 0 or x + w > frame_width or y + h > frame_height:
+        return True  # Bounding box touches or crosses the frame boundary
+    else:
+        return False  # Bounding box is completely inside the frame
+
+
+def display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list):
+    """
+    Display tracker information on the debug image.
+
+    Args:
+        debug_image (numpy.ndarray): Image on which to draw.
+        index (int): Index of the tracker.
+        algorithm (str): Name of the tracking algorithm.
+        elapsed_time_ms (float): Elapsed time in milliseconds.
+        score (str or float): Tracking score.
+        color_list (list): List of colors for drawing.
+    """
+    if score != '-':
+        text = f"{algorithm} : {elapsed_time_ms:.1f}ms Score:{score:.2f}"
+    else:
+        text = f"{algorithm} : {elapsed_time_ms:.1f}ms"
+    cv.putText(debug_image, text,
+               (10, int(25 * (index + 1))),
+               cv.FONT_HERSHEY_SIMPLEX,
+               0.7,
+               color_list[index % len(color_list)],
+               2, cv.LINE_AA)
+
+
 def process_tracking_results(trackers, debug_image, tracker_manager, color_list, scale_factor):
     """
     Process tracking results, draw bounding boxes, and handle tracking failures.
@@ -301,6 +361,10 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
         color_list (list): List of colors for drawing.
         scale_factor (float): The scaling factor used for resizing images.
     """
+    frame_height, frame_width = debug_image.shape[:2]  # Get frame dimensions
+
+    trackers_to_reset = []  # List to keep track of trackers that need to be reset
+
     for tracker_info in trackers:
         index = tracker_info['index']
         ok = tracker_info['ok']
@@ -318,10 +382,17 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
             h = int(h / scale_factor)
             new_bbox = [x, y, w, h]
 
+            # Use the separate function to check boundary crossing
+            if is_bbox_touches_frame(new_bbox, frame_width, frame_height):
+                logging.info(f"Tracker {index} ({algorithm}) bounding box crossed frame boundary. Resetting tracker.")
+                trackers_to_reset.append(index)
+                continue  # Skip drawing and processing this tracker
+
             # Draw bounding box
             cv.rectangle(debug_image,
-                         (new_bbox[0], new_bbox[1]),
-                         (new_bbox[0] + new_bbox[2], new_bbox[1] + new_bbox[3]),
+                         (max(new_bbox[0], 0), max(new_bbox[1], 0)),
+                         (min(new_bbox[0] + new_bbox[2], frame_width - 1),
+                          min(new_bbox[1] + new_bbox[3], frame_height - 1)),
                          color_list[index % len(color_list)],
                          thickness=2)
             logging.debug(f"Tracker {index} ({algorithm}) updated successfully with bbox: {new_bbox}")
@@ -331,18 +402,15 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
             tracker_manager.reset_trackers()
             break
 
-        # Display tracker info
+        # Display tracker info using the new function
         elapsed_time_ms = elapsed_time * 1000
-        if score != '-':
-            text = f"{algorithm} : {elapsed_time_ms:.1f}ms Score:{score:.2f}"
-        else:
-            text = f"{algorithm} : {elapsed_time_ms:.1f}ms"
-        cv.putText(debug_image, text,
-                   (10, int(25 * (index + 1))),
-                   cv.FONT_HERSHEY_SIMPLEX,
-                   0.7,
-                   color_list[index % len(color_list)],
-                   2, cv.LINE_AA)
+        display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
+
+    # Reset trackers that are marked for reset
+    if trackers_to_reset:
+        for idx in sorted(trackers_to_reset, reverse=True):
+            logging.info(f"Removing tracker {idx} due to boundary crossing.")
+            del tracker_manager.trackers[idx]
 
 
 def main():
