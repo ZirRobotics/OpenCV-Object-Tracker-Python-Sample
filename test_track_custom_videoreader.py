@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import copy
 import logging
 import queue
 import sys
 import threading
 import time
+import cProfile, pstats
 
 import cv2 as cv
 import numpy as np
@@ -52,6 +52,51 @@ def parse_arguments():
 def is_integer(s):
     """Check if the input string is an integer."""
     return s.isdigit() or (s.startswith('-') and s[1:].isdigit())
+
+
+class VideoCapture:
+    def __init__(self, uri):
+        self.cap = cv.VideoCapture(uri)
+        if not self.cap.isOpened():
+            logging.error(f"Cannot open video source: {uri}")
+            sys.exit(1)
+        self.q = queue.Queue(maxsize=1)
+        self.running = True
+        self.t = threading.Thread(target=self._reader)
+        self.t.daemon = True
+        self.t.start()
+        logging.info(f"VideoCapture thread started for {uri}.")
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.info("No frame received. Stopping VideoCapture thread.")
+                self.running = False
+                break
+            if not self.q.empty():
+                try:
+                    discarded_frame = self.q.get_nowait()  # Discard previous (unprocessed) frame
+                    logging.debug("Discarded an old frame from the queue.")
+                except queue.Empty:
+                    pass
+            self.q.put(frame)
+            logging.debug("Frame added to the queue.")
+
+    def read(self):
+        try:
+            frame = self.q.get(timeout=1)  # Wait up to 1 second for a frame
+            logging.debug("Frame retrieved from the queue.")
+            return True, frame
+        except queue.Empty:
+            logging.warning("No frame available in the queue.")
+            return False, None
+
+    def release(self):
+        self.running = False
+        self.t.join()
+        self.cap.release()
+        logging.info("VideoCapture released and thread joined.")
 
 
 class ObjectDetector(threading.Thread):
@@ -183,29 +228,28 @@ class TrackerManager:
         logging.info(f"Total trackers initialized: {len(self.trackers)}")
 
     def update_trackers(self, scaled_image):
-        """Update all trackers and collect results."""
-        threads = []
+        """Update all trackers and collect results sequentially."""
         lower_threshold = self.large_object_threshold * 0.8
         upper_threshold = self.large_object_threshold * 1.2
 
-        def update_single_tracker(tracker_info):
-            idx = tracker_info['index']
+        for idx, tracker_info in enumerate(self.trackers):
+            tracker_info['index'] = idx
             try:
                 tracker = tracker_info['tracker']
                 algorithm = tracker_info['algorithm']
                 start_time = time.time()
                 ok, bbox = tracker.update(scaled_image)
                 elapsed_time = time.time() - start_time
-                try:
-                    tracker_score = tracker.getTrackingScore()
-                except AttributeError:
-                    tracker_score = '-'
+                # try:
+                #     tracker_score = tracker.getTrackingScore()
+                # except AttributeError:
+                #     tracker_score = '-'
 
                 tracker_info.update({
                     'ok': ok,
                     'bbox': bbox,
-                    'elapsed_time': elapsed_time,
-                    'score': tracker_score
+                    'elapsed_time': elapsed_time
+                    # 'score': tracker_score
                 })
 
                 w, h = bbox[2], bbox[3]
@@ -222,15 +266,7 @@ class TrackerManager:
                 logging.error(f"Exception in tracker {idx} ({algorithm}): {e}")
                 tracker_info['ok'] = False
                 self.trackers.remove(tracker_info)
-
-        for idx, tracker_info in enumerate(self.trackers):
-            tracker_info['index'] = idx
-            t = threading.Thread(target=update_single_tracker, args=(tracker_info,))
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join()
+                continue  # Proceed with the next tracker
 
         return self.trackers
 
@@ -258,16 +294,18 @@ class TrackerManager:
 
 
 def setup_camera(device, width, height):
-    """Set up the video capture device."""
+    """Set up the video capture device using the custom VideoCapture class."""
     if is_integer(device):
         device = int(device)
-    cap = cv.VideoCapture(device)
-    if not cap.isOpened():
-        logging.error(f"Cannot open video source: {device}")
-        sys.exit(1)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-    logging.info(f"Video capture started on {device} with resolution {width}x{height}.")
+    uri = device  # Device can be an integer (webcam) or string (video file path)
+    cap = VideoCapture(uri)
+    # Optionally, set the desired resolution if not already set in the VideoCapture class
+    # However, since the custom class initializes VideoCapture with the given URI,
+    # setting width and height here might not be necessary.
+    # If needed, you can uncomment the following lines:
+    # cap.cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
+    # cap.cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
+    logging.info(f"Custom VideoCapture initialized for {uri} with resolution {width}x{height}.")
     return cap
 
 
@@ -409,8 +447,8 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
             break
 
         # Display tracker info using the new function
-        elapsed_time_ms = elapsed_time * 1000
-        display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
+        # elapsed_time_ms = elapsed_time * 1000
+        # display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
 
     # Reset trackers that are marked for reset
     if trackers_to_reset:
@@ -420,115 +458,121 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
 
 
 def main():
-    # Parse arguments
-    args = parse_arguments()
-
-    # Initialize variables
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-    scale_factor = args.scale_factor
-    large_object_threshold = args.large_object_threshold
-    model_path = args.model_path
-
-    # Setup camera
-    cap = setup_camera(cap_device, cap_width, cap_height)
-
-    # Load YOLO model
-    model = load_model(model_path)
-
-    # Create queues and stop event
-    frame_queue = queue.Queue(maxsize=1)
-    detection_queue = queue.Queue(maxsize=1)
-    stop_event = threading.Event()
-
-    # Start detection thread
-    detector = ObjectDetector(model, frame_queue, detection_queue, stop_event)
-    detector.start()
-    logging.info("Detection thread started.")
-
-    tracker_factory = TrackerFactory()
-    # Initialize tracker manager
-    tracker_manager = TrackerManager(scale_factor, large_object_threshold, tracker_factory)
-
-    # Initialize FPS variables
-    prev_time = time.time()
-    prev_fps = 0  # Initialize previous FPS for smoothing
-
-    window_name = 'Tracker Demo'
-    cv.namedWindow(window_name)
-
-    color_list = [
-        (255, 0, 0),     # blue
-        (255, 255, 0),   # aqua
-        (0, 255, 0),     # lime
-        (128, 0, 128),   # purple
-        (0, 0, 255),     # red
-        (255, 0, 255),   # fuchsia
-        (0, 128, 0),     # green
-        (128, 128, 0),   # teal
-        (0, 0, 128),     # maroon
-        (0, 128, 128),   # olive
-        (0, 255, 255),   # yellow
-    ]
+    profiler = cProfile.Profile()
+    profiler.enable()
 
     try:
-        while cap.isOpened():
+        # Parse arguments
+        args = parse_arguments()
+
+        # Initialize variables
+        cap_device = args.device
+        cap_width = args.width
+        cap_height = args.height
+        scale_factor = args.scale_factor
+        large_object_threshold = args.large_object_threshold
+        model_path = args.model_path
+
+        # Setup camera using the custom VideoCapture class
+        cap = setup_camera(cap_device, cap_width, cap_height)
+
+        # Load YOLO model
+        model = load_model(model_path)
+
+        # Create queues and stop event
+        frame_queue = queue.Queue(maxsize=1)
+        detection_queue = queue.Queue(maxsize=1)
+        stop_event = threading.Event()
+
+        # Start detection thread
+        detector = ObjectDetector(model, frame_queue, detection_queue, stop_event)
+        detector.start()
+        logging.info("Detection thread started.")
+
+        tracker_factory = TrackerFactory()
+        # Initialize tracker manager
+        tracker_manager = TrackerManager(scale_factor, large_object_threshold, tracker_factory)
+
+        # Initialize FPS variables
+        prev_time = time.time()
+        prev_fps = 0
+
+        window_name = 'Tracker Demo'
+        cv.namedWindow(window_name)
+
+        color_list = [
+            (255, 0, 0),     # blue
+            (255, 255, 0),   # aqua
+            (0, 255, 0),     # lime
+            (128, 0, 128),   # purple
+            (0, 0, 255),     # red
+            (255, 0, 255),   # fuchsia
+            (0, 128, 0),     # green
+            (128, 128, 0),   # teal
+            (0, 0, 128),     # maroon
+            (0, 128, 128),   # olive
+            (0, 255, 255),   # yellow
+        ]
+
+        DETECTION_INTERVAL = 5
+        frame_count = 0
+
+        while cap.running:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 logging.info("No frame received. Exiting main loop.")
                 break
 
-            # Calculate and display FPS using the draw_fps function
+            frame_count += 1
+
+            # Calculate and display FPS
             prev_time, prev_fps = draw_fps(frame, prev_time, prev_fps)
 
-            # debug_image = frame.copy()
-
-            # Put frame into detection queue
-            if not frame_queue.full():
+            # Perform detection every DETECTION_INTERVAL frames
+            if frame_count % DETECTION_INTERVAL == 0 and not frame_queue.full():
                 frame_queue.put(frame)
-                logging.debug("Frame added to frame_queue.")
-            else:
-                logging.debug("Frame queue is full. Skipping frame.")
+                logging.debug("Frame added to frame_queue for detection.")
 
             # Retrieve detection results
             try:
                 detected_bboxes = detection_queue.get_nowait()
                 if detected_bboxes:
-                    logging.debug(f"Retrieved {len(detected_bboxes)} bounding boxes from detection_queue.")
                     tracker_manager.initialize_trackers(frame, detected_bboxes)
             except queue.Empty:
                 pass
 
-            # Scale frame for tracking
+            # Scale frame and update trackers
             scaled_frame = cv.resize(frame, None, fx=scale_factor, fy=scale_factor, interpolation=cv.INTER_LINEAR)
-
-            # Update trackers
             trackers = tracker_manager.update_trackers(scaled_frame)
 
-            # Process tracking results using the new function
+            # Process tracking results
             process_tracking_results(trackers, frame, tracker_manager, color_list, scale_factor)
 
             # Display the frame
             cv.imshow(window_name, frame)
 
-            # Handle key events
-            k = cv.waitKey(1)
-            if k == 27:  # ESC
+            if cv.waitKey(1) == 27:  # ESC key
                 logging.info("ESC key pressed. Exiting.")
                 break
 
-    except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt received. Exiting.")
     except Exception as e:
-        logging.error(f"Unexpected error in main loop: {e}")
+        logging.error(f"Error in main: {e}")
     finally:
-        # Cleanup
         stop_event.set()
-        detector.join(timeout=2)
+        detector.join()
         cap.release()
         cv.destroyAllWindows()
-        logging.info("Resources released and program terminated gracefully.")
+
+        profiler.disable()
+        # Save and print profiling results
+        stats = pstats.Stats(profiler).sort_stats('cumtime')
+        stats.dump_stats('profiling_results.prof')
+        stats.print_stats(20)  # Print the top 20 slowest functions
+        logging.info("Profiling results saved to 'profiling_results.prof'.")
+
+    profiler.disable()
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.dump_stats('profiling_results.prof')
 
 
 if __name__ == '__main__':

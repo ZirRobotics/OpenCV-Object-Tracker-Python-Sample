@@ -1,274 +1,529 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import re
-import sys
-import copy
-import time
+
 import argparse
+import logging
+import queue
+import sys
+import threading
+import time
+import cProfile, pstats
 
 import cv2 as cv
 import numpy as np
 from ultralytics import YOLO
 
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG to capture all levels of logs
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("tracker_debug.log"),  # Log to file
+        logging.StreamHandler(sys.stdout)          # Also log to console
+    ]
+)
 
-def get_args():
-    parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", default="sample_movie/bird.mp4")
-    parser.add_argument("--width", help='cap width', type=int, default=960)
-    parser.add_argument("--height", help='cap height', type=int, default=540)
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Object Tracking Application")
 
-    parser.add_argument('--use_mil', action='store_true')
-    parser.add_argument('--use_goturn', action='store_true')
-    parser.add_argument('--use_dasiamrpn', action='store_true')
-    parser.add_argument('--use_csrt', action='store_true')
-    parser.add_argument('--use_kcf', action='store_true')
-    parser.add_argument('--use_boosting', action='store_true')
-    parser.add_argument('--use_mosse', action='store_true')
-    parser.add_argument('--use_medianflow', action='store_true')
-    parser.add_argument('--use_tld', action='store_true')
-    parser.add_argument('--use_nano', action='store_true')
-    parser.add_argument('--use_vit', action='store_true')
+    parser.add_argument("--device", default="sample_movie/bird.mp4",
+                        help="Video source. Use integer for webcam or string for video file.")
+    parser.add_argument("--width", type=int, default=1280,
+                        help="Capture width")
+    parser.add_argument("--height", type=int, default=720,
+                        help="Capture height")
+
+    parser.add_argument('--scale_factor', type=float, default=0.8,
+                        help="Scale factor for downscaling frames for tracking")
+    parser.add_argument('--large_object_threshold', type=int, default=500,
+                        help="Threshold area in scaled image to decide tracker algorithm")
+
+    parser.add_argument('--model_path', type=str, required=True,
+                        help="Path to the YOLOv8 model")
 
     args = parser.parse_args()
+    logging.debug(f"Parsed arguments: {args}")
 
     return args
 
 
-def isint(s):
-    p = '[-+]?\d+'
-    return True if re.fullmatch(p, s) else False
+def is_integer(s):
+    """Check if the input string is an integer."""
+    return s.isdigit() or (s.startswith('-') and s[1:].isdigit())
 
 
-def detect_objects(frame, model):
+class ObjectDetector(threading.Thread):
+    """Object detector running in a separate thread."""
+    def __init__(self, model, frame_queue, detection_queue, stop_event):
+        super().__init__(daemon=True)
+        self.model = model
+        self.frame_queue = frame_queue
+        self.detection_queue = detection_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                # Reduced timeout to check stop_event more frequently
+                frame = self.frame_queue.get(timeout=0.1)
+                logging.debug("Frame retrieved from frame_queue for detection.")
+                bboxes = self.detect_objects(frame)
+                self.detection_queue.put(bboxes)
+                logging.debug("Object detection completed and results put into detection_queue.")
+            except queue.Empty:
+                continue  # Loop again and check stop_event
+            except Exception as e:
+                logging.error(f"Exception in ObjectDetector: {e}")
+                continue  # Continue the loop even if an error occurs
+
+    def detect_objects(self, frame):
+        """Perform object detection on the frame."""
+        try:
+            results = self.model(frame)
+            bboxes = []
+            for result in results:
+                for box in result.boxes:
+                    # Get the class ID and bounding box coordinates
+                    cls_id = int(box.cls[0])  # Class ID
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    w = int(x2 - x1)
+                    h = int(y2 - y1)
+
+                    # Filter for class 0 only
+                    if cls_id == 0 and w > 0 and h > 0:
+                        bboxes.append((int(x1), int(y1), w, h))
+                    elif cls_id != 0:
+                        logging.debug(f"Skipping detection for class {cls_id}.")
+                    else:
+                        logging.warning(f"Detected invalid bounding box with zero area: {(x1, y1, w, h)}")
+            logging.debug(f"Detected {len(bboxes)} bounding boxes for class 0.")
+            return bboxes
+        except Exception as e:
+            logging.error(f"Error during object detection: {e}")
+            return []
+
+
+class TrackerFactory:
     """
-    Object detection using YOLOv8.
+    Factory class to handle tracker creation based on specified algorithms.
     """
-    # Perform detection
-    results = model(frame)
+    def __init__(self):
+        self.nano_backbone_path = "model/nanotrackv2/nanotrack_backbone_sim.onnx"
+        self.nano_neckhead_path = "model/nanotrackv2/nanotrack_head_sim.onnx"
 
-    # Extract bounding boxes
-    bboxes = []
-    for result in results:
-        for box in result.boxes:
-            x1, y1, x2, y2 = box.xyxy[0]  # Get the bounding box coordinates
-            bboxes.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+    def create_tracker(self, image, bbox, algorithm):
+        """
+        Create and initialize a tracker based on the specified algorithm.
 
-    return bboxes
+        Args:
+            image (numpy.ndarray): The image used for initializing the tracker.
+            bbox (tuple): The bounding box for the object (x, y, w, h).
+            algorithm (str): The algorithm to use for the tracker (e.g., 'Nano', 'KCF').
 
+        Returns:
+            dict or None: A dictionary containing tracker info or None if initialization fails.
+        """
+        # Validate the bounding box
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            logging.error(f"Invalid bounding box with zero area: {bbox}. Cannot initialize tracker.")
+            return None
 
-def initialize_tracker_list(window_name, image, tracker_algorithm_list, detected_bboxes):
-    tracker_list = []
+        tracker = None
+        logging.debug(f"Initializing tracker '{algorithm}' with bbox: {bbox}")
 
-    # Tracker list generation
-    for tracker_algorithm in tracker_algorithm_list:
-        for bbox in detected_bboxes:
-            tracker = None
-            if tracker_algorithm == 'MIL':
-                tracker = cv.TrackerMIL_create()
-            if tracker_algorithm == 'GOTURN':
-                params = cv.TrackerGOTURN_Params()
-                params.modelTxt = "model/GOTURN/goturn.prototxt"
-                params.modelBin = "model/GOTURN/goturn.caffemodel"
-                tracker = cv.TrackerGOTURN_create(params)
-            if tracker_algorithm == 'DaSiamRPN':
-                params = cv.TrackerDaSiamRPN_Params()
-                params.model = "model/DaSiamRPN/dasiamrpn_model.onnx"
-                params.kernel_r1 = "model/DaSiamRPN/dasiamrpn_kernel_r1.onnx"
-                params.kernel_cls1 = "model/DaSiamRPN/dasiamrpn_kernel_cls1.onnx"
-                tracker = cv.TrackerDaSiamRPN_create(params)
-            if tracker_algorithm == 'Nano':
-                params = cv.TrackerNano_Params()
-                params.backbone = "model/nanotrackv2/nanotrack_backbone_sim.onnx"
-                params.neckhead = "model/nanotrackv2/nanotrack_head_sim.onnx"
-                tracker = cv.TrackerNano_create(params)
-            if tracker_algorithm == 'Vit':
-                params = cv.TrackerVit_Params()
-                params.net = "model/vit/object_tracking_vittrack_2023sep.onnx"
-                tracker = cv.TrackerVit_create(params)
-            if tracker_algorithm == 'CSRT':
-                tracker = cv.TrackerCSRT_create()
-            if tracker_algorithm == 'KCF':
-                tracker = cv.TrackerKCF_create()
-            if tracker_algorithm == 'Boosting':
-                tracker = cv.legacy_TrackerBoosting.create()
-            if tracker_algorithm == 'MOSSE':
-                tracker = cv.legacy_TrackerMOSSE.create()
-            if tracker_algorithm == 'MedianFlow':
-                tracker = cv.legacy_TrackerMedianFlow.create()
-            if tracker_algorithm == 'TLD':
-                tracker = cv.legacy_TrackerTLD.create()
+        if algorithm == 'Nano':
+            params = cv.TrackerNano_Params()
+            params.backbone = self.nano_backbone_path
+            params.neckhead = self.nano_neckhead_path
+            tracker = cv.TrackerNano_create(params)
+        elif algorithm == 'KCF':
+            tracker = cv.TrackerKCF_create()
+        else:
+            logging.warning(f"Unknown tracker algorithm: {algorithm}")
+            return None
 
-            if tracker is not None:
+        if tracker is not None:
+            try:
                 tracker.init(image, bbox)
-                tracker_list.append(tracker)
+                logging.debug(f"Successfully initialized '{algorithm}' tracker with bbox: {bbox}")
+                return {'tracker': tracker, 'algorithm': algorithm, 'bbox': bbox}
+            except Exception as e:
+                logging.error(f"Exception during tracker initialization for '{algorithm}' with bbox {bbox}: {e}")
+        else:
+            logging.error(f"Failed to initialize '{algorithm}' tracker with bbox: {bbox}")
+        return None
 
-    return tracker_list
+
+class TrackerManager:
+    """Manager for handling multiple trackers."""
+    def __init__(self, scale_factor, large_object_threshold, tracker_factory):
+        self.scale_factor = scale_factor
+        self.large_object_threshold = large_object_threshold
+        self.trackers = []
+        self.tracker_factory = tracker_factory
+
+    def initialize_trackers(self, scaled_image, detected_bboxes):
+        """Initialize trackers based on detected bounding boxes."""
+        self.trackers = []
+        for bbox in detected_bboxes:
+            scaled_bbox = (
+                int(bbox[0] * self.scale_factor),
+                int(bbox[1] * self.scale_factor),
+                int(bbox[2] * self.scale_factor),
+                int(bbox[3] * self.scale_factor)
+            )
+            area = scaled_bbox[2] * scaled_bbox[3]
+            algorithm = 'KCF' if area > self.large_object_threshold else 'Nano'
+            tracker_info = self.tracker_factory.create_tracker(scaled_image, scaled_bbox, algorithm)
+            if tracker_info:
+                self.trackers.append(tracker_info)
+        logging.info(f"Total trackers initialized: {len(self.trackers)}")
+
+    def update_trackers(self, scaled_image):
+        """Update all trackers and collect results sequentially."""
+        lower_threshold = self.large_object_threshold * 0.8
+        upper_threshold = self.large_object_threshold * 1.2
+
+        for idx, tracker_info in enumerate(self.trackers):
+            tracker_info['index'] = idx
+            try:
+                tracker = tracker_info['tracker']
+                algorithm = tracker_info['algorithm']
+                start_time = time.time()
+                ok, bbox = tracker.update(scaled_image)
+                elapsed_time = time.time() - start_time
+                # try:
+                #     tracker_score = tracker.getTrackingScore()
+                # except AttributeError:
+                #     tracker_score = '-'
+
+                tracker_info.update({
+                    'ok': ok,
+                    'bbox': bbox,
+                    'elapsed_time': elapsed_time
+                    # 'score': tracker_score
+                })
+
+                w, h = bbox[2], bbox[3]
+                area = w * h
+
+                if algorithm == 'KCF' and area <= lower_threshold:
+                    logging.info(f"Switching tracker {idx} from KCF to Nano due to size decrease.")
+                    self.switch_tracker(tracker_info, scaled_image, 'Nano')
+                elif algorithm == 'Nano' and area >= upper_threshold:
+                    logging.info(f"Switching tracker {idx} from Nano to KCF due to size increase.")
+                    self.switch_tracker(tracker_info, scaled_image, 'KCF')
+
+            except Exception as e:
+                logging.error(f"Exception in tracker {idx} ({algorithm}): {e}")
+                tracker_info['ok'] = False
+                self.trackers.remove(tracker_info)
+                continue  # Proceed with the next tracker
+
+        return self.trackers
+
+    def switch_tracker(self, tracker_info, scaled_image, new_algorithm):
+        """Switch the tracker algorithm for a given tracker_info."""
+        idx = tracker_info['index']
+        bbox = tracker_info['bbox']
+        new_tracker_info = self.tracker_factory.create_tracker(scaled_image, bbox, new_algorithm)
+
+        if new_tracker_info:
+            tracker_info.update({
+                'tracker': new_tracker_info['tracker'],
+                'algorithm': new_algorithm,
+            })
+            logging.info(f"Tracker {idx} switched to {new_algorithm}.")
+        else:
+            logging.error(f"Failed to switch tracker {idx} to {new_algorithm} due to invalid bbox. Removing tracker.")
+            # Remove the tracker since it cannot be initialized
+            tracker_info['ok'] = False
+            self.trackers.remove(tracker_info)
+
+    def reset_trackers(self):
+        """Reset all trackers."""
+        self.trackers = []
+
+
+def setup_camera(device, width, height):
+    """Set up the video capture device."""
+    if is_integer(device):
+        device = int(device)
+    cap = cv.VideoCapture(device)
+    if not cap.isOpened():
+        logging.error(f"Cannot open video source: {device}")
+        sys.exit(1)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
+    logging.info(f"Video capture started on {device} with resolution {width}x{height}.")
+    return cap
+
+
+def load_model(model_path):
+    """Load the YOLOv8 model."""
+    try:
+        model = YOLO(model_path, task='detect')
+        logging.info(f"YOLOv8 model loaded from {model_path}.")
+        return model
+    except Exception as e:
+        logging.error(f"Failed to load YOLOv8 model: {e}")
+        sys.exit(1)
+
+
+def draw_fps(frame, prev_time, prev_fps):
+    # Calculate current time and frame duration
+    current_time = time.perf_counter()
+    frame_duration = current_time - prev_time
+
+    # Calculate instantaneous FPS
+    instantaneous_fps = 1.0 / frame_duration if frame_duration > 0 else 0
+
+    # Apply exponential smoothing
+    fps = 0.9 * prev_fps + 0.1 * instantaneous_fps
+
+    # Update previous time
+    prev_time = current_time
+
+    # Prepare FPS text
+    fps_text = f"FPS: {fps:.2f}"
+
+    # Calculate text size for positioning
+    text_size, _ = cv.getTextSize(fps_text, cv.FONT_HERSHEY_SIMPLEX, 1, 2)
+    text_x = frame.shape[1] - text_size[0] - 10
+    text_y = 30
+
+    # Draw FPS text on the frame
+    cv.putText(frame, fps_text, (text_x, text_y),
+               cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv.LINE_AA)
+
+    return prev_time, fps
+
+
+def is_bbox_touches_frame(bbox, frame_width, frame_height):
+    """
+    Check if any part of the bounding box is touches the frame boundaries.
+
+    Args:
+        bbox (list or tuple): Bounding box in the format [x, y, w, h].
+        frame_width (int): Width of the frame.
+        frame_height (int): Height of the frame.
+
+    Returns:
+        bool: True if any part of the bounding box is touches the frame, False otherwise.
+    """
+    x, y, w, h = bbox
+
+    # Check if bounding box is within frame boundaries
+    if x < 0 or y < 0 or x + w > frame_width or y + h > frame_height:
+        return True  # Bounding box touches or crosses the frame boundary
+    else:
+        return False  # Bounding box is completely inside the frame
+
+
+def display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list):
+    """
+    Display tracker information on the debug image.
+
+    Args:
+        debug_image (numpy.ndarray): Image on which to draw.
+        index (int): Index of the tracker.
+        algorithm (str): Name of the tracking algorithm.
+        elapsed_time_ms (float): Elapsed time in milliseconds.
+        score (str or float): Tracking score.
+        color_list (list): List of colors for drawing.
+    """
+    if score != '-':
+        text = f"{algorithm} : {elapsed_time_ms:.1f}ms Score:{score:.2f}"
+    else:
+        text = f"{algorithm} : {elapsed_time_ms:.1f}ms"
+    cv.putText(debug_image, text,
+               (10, int(25 * (index + 1))),
+               cv.FONT_HERSHEY_SIMPLEX,
+               0.7,
+               color_list[index % len(color_list)],
+               2, cv.LINE_AA)
+
+
+def process_tracking_results(trackers, debug_image, tracker_manager, color_list, scale_factor):
+    """
+    Process tracking results, draw bounding boxes, and handle tracking failures.
+
+    Args:
+        trackers (list): List of tracker information dictionaries.
+        debug_image (numpy.ndarray): Image on which to draw.
+        tracker_manager (TrackerManager): The tracker manager instance.
+        color_list (list): List of colors for drawing.
+        scale_factor (float): The scaling factor used for resizing images.
+    """
+    frame_height, frame_width = debug_image.shape[:2]  # Get frame dimensions
+
+    trackers_to_reset = []  # List to keep track of trackers that need to be reset
+
+    for tracker_info in trackers:
+        index = tracker_info['index']
+        ok = tracker_info['ok']
+        bbox = tracker_info['bbox']
+        algorithm = tracker_info['algorithm']
+        elapsed_time = tracker_info['elapsed_time']
+        score = tracker_info.get('score', '-')
+
+        if ok:
+            # Scale bbox back to original size
+            x, y, w, h = bbox
+            x = int(x / scale_factor)
+            y = int(y / scale_factor)
+            w = int(w / scale_factor)
+            h = int(h / scale_factor)
+            new_bbox = [x, y, w, h]
+
+            # Use the separate function to check boundary crossing
+            if is_bbox_touches_frame(new_bbox, frame_width, frame_height):
+                logging.info(f"Tracker {index} ({algorithm}) bounding box crossed frame boundary. Resetting tracker.")
+                trackers_to_reset.append(index)
+                continue  # Skip drawing and processing this tracker
+
+            # Draw bounding box
+            cv.rectangle(debug_image,
+                         (max(new_bbox[0], 0), max(new_bbox[1], 0)),
+                         (min(new_bbox[0] + new_bbox[2], frame_width - 1),
+                          min(new_bbox[1] + new_bbox[3], frame_height - 1)),
+                         color_list[index % len(color_list)],
+                         thickness=2)
+            logging.debug(f"Tracker {index} ({algorithm}) updated successfully with bbox: {new_bbox}")
+        else:
+            # If tracking fails, reset trackers
+            logging.warning(f"Tracker {index} ({algorithm}) failed to update. Resetting trackers.")
+            tracker_manager.reset_trackers()
+            break
+
+        # Display tracker info using the new function
+        # elapsed_time_ms = elapsed_time * 1000
+        # display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
+
+    # Reset trackers that are marked for reset
+    if trackers_to_reset:
+        for idx in sorted(trackers_to_reset, reverse=True):
+            logging.info(f"Removing tracker {idx} due to boundary crossing.")
+            del tracker_manager.trackers[idx]
 
 
 def main():
-    color_list = [
-        [255, 0, 0],  # blue
-        [255, 255, 0],  # aqua
-        [0, 255, 0],  # lime
-        [128, 0, 128],  # purple
-        [0, 0, 255],  # red
-        [255, 0, 255],  # fuchsia
-        [0, 128, 0],  # green
-        [128, 128, 0],  # teal
-        [0, 0, 128],  # maroon
-        [0, 128, 128],  # olive
-        [0, 255, 255],  # yellow
-    ]
+    profiler = cProfile.Profile()
+    profiler.enable()
 
-    # Parse arguments ########################################################
-    args = get_args()
+    try:
+        # Parse arguments
+        args = parse_arguments()
 
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
+        # Initialize variables
+        cap_device = args.device
+        cap_width = args.width
+        cap_height = args.height
+        scale_factor = args.scale_factor
+        large_object_threshold = args.large_object_threshold
+        model_path = args.model_path
 
-    use_mil = args.use_mil
-    use_goturn = args.use_goturn
-    use_dasiamrpn = args.use_dasiamrpn
-    use_csrt = args.use_csrt
-    use_kcf = args.use_kcf
-    use_boosting = args.use_boosting
-    use_mosse = args.use_mosse
-    use_medianflow = args.use_medianflow
-    use_tld = args.use_tld
-    use_nano = args.use_nano
-    use_vit = args.use_vit
+        # Setup camera
+        cap = setup_camera(cap_device, cap_width, cap_height)
 
-    # Tracker algorithm selection ############################################
-    tracker_algorithm_list = []
-    if use_mil:
-        tracker_algorithm_list.append('MIL')
-    if use_goturn:
-        tracker_algorithm_list.append('GOTURN')
-    if use_dasiamrpn:
-        tracker_algorithm_list.append('DaSiamRPN')
-    if use_csrt:
-        tracker_algorithm_list.append('CSRT')
-    if use_kcf:
-        tracker_algorithm_list.append('KCF')
-    if use_boosting:
-        tracker_algorithm_list.append('Boosting')
-    if use_mosse:
-        tracker_algorithm_list.append('MOSSE')
-    if use_medianflow:
-        tracker_algorithm_list.append('MedianFlow')
-    if use_tld:
-        tracker_algorithm_list.append('TLD')
-    if use_nano:
-        tracker_algorithm_list.append('Nano')
-    if use_vit:
-        tracker_algorithm_list.append('Vit')
+        # Load YOLO model
+        model = load_model(model_path)
 
-    if len(tracker_algorithm_list) == 0:
-        tracker_algorithm_list.append('DaSiamRPN')
-    print(tracker_algorithm_list)
+        # Create queues and stop event
+        frame_queue = queue.Queue(maxsize=1)
+        detection_queue = queue.Queue(maxsize=1)
+        stop_event = threading.Event()
 
-    # Camera setup ###########################################################
-    if isint(cap_device):
-        cap_device = int(cap_device)
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+        # Start detection thread
+        detector = ObjectDetector(model, frame_queue, detection_queue, stop_event)
+        detector.start()
+        logging.info("Detection thread started.")
 
-    # Load YOLOv8 model ######################################################
-    model = YOLO(r"D:\pycharm_projects\yolov8\runs\detect\drone_v9_300ep_32bath\weights\best.pt", task='detect')  # Ensure you have the correct path to your YOLOv8 model
+        tracker_factory = TrackerFactory()
+        # Initialize tracker manager
+        tracker_manager = TrackerManager(scale_factor, large_object_threshold, tracker_factory)
 
-    # Tracker initialization #################################################
-    window_name = 'Tracker Demo'
-    cv.namedWindow(window_name)
+        # Initialize FPS variables
+        prev_time = time.time()
+        prev_fps = 0
 
-    tracker_list = []
-    detected_bboxes = []
+        window_name = 'Tracker Demo'
+        cv.namedWindow(window_name)
 
-    while cap.isOpened():
-        ret, image = cap.read()
-        if not ret:
-            break
-        debug_image = copy.deepcopy(image)
+        color_list = [
+            (255, 0, 0),     # blue
+            (255, 255, 0),   # aqua
+            (0, 255, 0),     # lime
+            (128, 0, 128),   # purple
+            (0, 0, 255),     # red
+            (255, 0, 255),   # fuchsia
+            (0, 128, 0),     # green
+            (128, 128, 0),   # teal
+            (0, 0, 128),     # maroon
+            (0, 128, 128),   # olive
+            (0, 255, 255),   # yellow
+        ]
 
-        # If no tracker is initialized, run detection until an object is found
-        if not tracker_list:
-            detected_bboxes = detect_objects(image, model)
-            if detected_bboxes:
-                tracker_list = initialize_tracker_list(window_name, image, tracker_algorithm_list, detected_bboxes)
+        DETECTION_INTERVAL = 5
+        frame_count = 0
 
-        elapsed_time_list = []
-        tracker_scores = []  # Initialize a list to store tracker scores
-
-        for index, tracker in enumerate(tracker_list):
-            # Update tracking
-            start_time = time.time()
-            ok, bbox = tracker.update(image)
-            try:
-                tracker_score = tracker.getTrackingScore()
-            except:
-                tracker_score = '-'
-
-            elapsed_time_list.append(time.time() - start_time)
-            tracker_scores.append(tracker_score)  # Append the score to the list
-
-            if ok:
-                # Draw bounding box after tracking
-                new_bbox = [
-                    int(bbox[0]),
-                    int(bbox[1]),
-                    int(bbox[2]),
-                    int(bbox[3])
-                ]
-                cv.rectangle(debug_image,
-                             (new_bbox[0], new_bbox[1]),
-                             (new_bbox[0] + new_bbox[2], new_bbox[1] + new_bbox[3]),
-                             color_list[index % len(color_list)],
-                             thickness=2)
-            else:
-                # If tracking fails, reset trackers
-                tracker_list = []
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                logging.info("No frame received. Exiting main loop.")
                 break
 
-        # Display processing time and tracker scores for each algorithm
-        for index, tracker_algorithm in enumerate(tracker_algorithm_list):
-            if index < len(elapsed_time_list):
-                elapsed_time_ms = elapsed_time_list[index] * 1000
-                if index < len(tracker_scores):
-                    score = tracker_scores[index]
-                    if score != '-':
-                        text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms Score:{score:.2f}"
-                    else:
-                        text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms"
-                else:
-                    text = f"{tracker_algorithm} : {elapsed_time_ms:.1f}ms"
-            else:
-                text = f"{tracker_algorithm} : N/A"
+            frame_count += 1
 
-            cv.putText(
-                debug_image,
-                text,
-                (10, int(25 * (index + 1))),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                color_list[index % len(color_list)],
-                2,
-                cv.LINE_AA
-            )
+            # Calculate and display FPS
+            prev_time, prev_fps = draw_fps(frame, prev_time, prev_fps)
 
-        cv.imshow(window_name, debug_image)
+            # Perform detection every DETECTION_INTERVAL frames
+            if frame_count % DETECTION_INTERVAL == 0 and not frame_queue.full():
+                frame_queue.put(frame)
 
-        k = cv.waitKey(1)
-        if k == 32:  # SPACE
-            # Reinitialize trackers based on new selection
-            detected_bboxes = detect_objects(image, model)
-            tracker_list = initialize_tracker_list(window_name, image, tracker_algorithm_list, detected_bboxes)
-        if k == 27:  # ESC
-            break
+            # Retrieve detection results
+            try:
+                detected_bboxes = detection_queue.get_nowait()
+                if detected_bboxes:
+                    tracker_manager.initialize_trackers(frame, detected_bboxes)
+            except queue.Empty:
+                pass
 
-    cap.release()
-    cv.destroyAllWindows()
+            # Scale frame and update trackers
+            scaled_frame = cv.resize(frame, None, fx=scale_factor, fy=scale_factor, interpolation=cv.INTER_LINEAR)
+            trackers = tracker_manager.update_trackers(scaled_frame)
+
+            # Process tracking results
+            process_tracking_results(trackers, frame, tracker_manager, color_list, scale_factor)
+
+            # Display the frame
+            cv.imshow(window_name, frame)
+
+            if cv.waitKey(1) == 27:  # ESC key
+                break
+
+    except Exception as e:
+        logging.error(f"Error in main: {e}")
+    finally:
+        stop_event.set()
+        detector.join()
+        cap.release()
+        cv.destroyAllWindows()
+
+        profiler.disable()
+        # Save and print profiling results
+        stats = pstats.Stats(profiler).sort_stats('cumtime')
+        stats.dump_stats('profiling_results.prof')
+        stats.print_stats(20)  # Print the top 20 slowest functions
+        logging.info("Profiling results saved to 'profiling_results.prof'.")
+
+    profiler.disable()
+    stats = pstats.Stats(profiler).sort_stats('cumtime')
+    stats.dump_stats('profiling_results.prof')
 
 
 if __name__ == '__main__':

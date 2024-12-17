@@ -8,6 +8,7 @@ import queue
 import sys
 import threading
 import time
+import os
 
 import cv2 as cv
 import numpy as np
@@ -30,10 +31,7 @@ def parse_arguments():
 
     parser.add_argument("--device", default="sample_movie/bird.mp4",
                         help="Video source. Use integer for webcam or string for video file.")
-    parser.add_argument("--width", type=int, default=1280,
-                        help="Capture width")
-    parser.add_argument("--height", type=int, default=720,
-                        help="Capture height")
+    # Removed --width and --height arguments
 
     parser.add_argument('--scale_factor', type=float, default=0.8,
                         help="Scale factor for downscaling frames for tracking")
@@ -113,6 +111,12 @@ class TrackerFactory:
         self.nano_backbone_path = "model/nanotrackv2/nanotrack_backbone_sim.onnx"
         self.nano_neckhead_path = "model/nanotrackv2/nanotrack_head_sim.onnx"
 
+        # Verify model files exist
+        if not os.path.exists(self.nano_backbone_path):
+            logging.error(f"Nano tracker backbone model not found at {self.nano_backbone_path}.")
+        if not os.path.exists(self.nano_neckhead_path):
+            logging.error(f"Nano tracker neckhead model not found at {self.nano_neckhead_path}.")
+
     def create_tracker(self, image, bbox, algorithm):
         """
         Create and initialize a tracker based on the specified algorithm.
@@ -135,12 +139,20 @@ class TrackerFactory:
         logging.debug(f"Initializing tracker '{algorithm}' with bbox: {bbox}")
 
         if algorithm == 'Nano':
-            params = cv.TrackerNano_Params()
-            params.backbone = self.nano_backbone_path
-            params.neckhead = self.nano_neckhead_path
-            tracker = cv.TrackerNano_create(params)
+            if hasattr(cv, 'TrackerNano_Params') and hasattr(cv, 'TrackerNano_create'):
+                params = cv.TrackerNano_Params()
+                params.backbone = self.nano_backbone_path
+                params.neckhead = self.nano_neckhead_path
+                tracker = cv.TrackerNano_create(params)
+            else:
+                logging.error("OpenCV does not have TrackerNano. Ensure that your OpenCV build includes Nano tracker.")
+                return None
         elif algorithm == 'KCF':
-            tracker = cv.TrackerKCF_create()
+            if hasattr(cv, 'TrackerKCF_create'):
+                tracker = cv.TrackerKCF_create()
+            else:
+                logging.error("OpenCV does not have TrackerKCF. Ensure that your OpenCV build includes KCF tracker.")
+                return None
         else:
             logging.warning(f"Unknown tracker algorithm: {algorithm}")
             return None
@@ -257,7 +269,7 @@ class TrackerManager:
         self.trackers = []
 
 
-def setup_camera(device, width, height):
+def setup_camera(device):
     """Set up the video capture device."""
     if is_integer(device):
         device = int(device)
@@ -265,9 +277,7 @@ def setup_camera(device, width, height):
     if not cap.isOpened():
         logging.error(f"Cannot open video source: {device}")
         sys.exit(1)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-    logging.info(f"Video capture started on {device} with resolution {width}x{height}.")
+    logging.info(f"Video capture started on {device}.")
     return cap
 
 
@@ -313,7 +323,7 @@ def draw_fps(frame, prev_time, prev_fps):
 
 def is_bbox_touches_frame(bbox, frame_width, frame_height):
     """
-    Check if any part of the bounding box is touches the frame boundaries.
+    Check if any part of the bounding box touches the frame boundaries.
 
     Args:
         bbox (list or tuple): Bounding box in the format [x, y, w, h].
@@ -321,7 +331,7 @@ def is_bbox_touches_frame(bbox, frame_width, frame_height):
         frame_height (int): Height of the frame.
 
     Returns:
-        bool: True if any part of the bounding box is touches the frame, False otherwise.
+        bool: True if any part of the bounding box touches the frame, False otherwise.
     """
     x, y, w, h = bbox
 
@@ -388,7 +398,7 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
             h = int(h / scale_factor)
             new_bbox = [x, y, w, h]
 
-            # Use the separate function to check boundary crossing
+            # Check boundary crossing
             if is_bbox_touches_frame(new_bbox, frame_width, frame_height):
                 logging.info(f"Tracker {index} ({algorithm}) bounding box crossed frame boundary. Resetting tracker.")
                 trackers_to_reset.append(index)
@@ -408,9 +418,9 @@ def process_tracking_results(trackers, debug_image, tracker_manager, color_list,
             tracker_manager.reset_trackers()
             break
 
-        # Display tracker info using the new function
-        elapsed_time_ms = elapsed_time * 1000
-        display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
+        # Optionally display tracker info
+        # elapsed_time_ms = elapsed_time * 1000
+        # display_tracker_info(debug_image, index, algorithm, elapsed_time_ms, score, color_list)
 
     # Reset trackers that are marked for reset
     if trackers_to_reset:
@@ -423,19 +433,23 @@ def main():
     # Parse arguments
     args = parse_arguments()
 
-    # Initialize variables
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
-    scale_factor = args.scale_factor
-    large_object_threshold = args.large_object_threshold
-    model_path = args.model_path
-
     # Setup camera
-    cap = setup_camera(cap_device, cap_width, cap_height)
+    cap = setup_camera(args.device)
+
+    # Retrieve original frame dimensions
+    cap_width = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+    cap_height = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+    frame_rate = cap.get(cv.CAP_PROP_FPS)
+    if frame_rate == 0.0:
+        logging.warning("Failed to get frame rate from capture device. Using default 30.0 FPS.")
+        frame_rate = 30.0
+    else:
+        logging.info(f"Input frame rate: {frame_rate} FPS")
+
+    logging.info(f"Original frame size: {cap_width}x{cap_height}")
 
     # Load YOLO model
-    model = load_model(model_path)
+    model = load_model(args.model_path)
 
     # Create queues and stop event
     frame_queue = queue.Queue(maxsize=1)
@@ -449,11 +463,34 @@ def main():
 
     tracker_factory = TrackerFactory()
     # Initialize tracker manager
-    tracker_manager = TrackerManager(scale_factor, large_object_threshold, tracker_factory)
+    tracker_manager = TrackerManager(args.scale_factor, args.large_object_threshold, tracker_factory)
 
     # Initialize FPS variables
     prev_time = time.time()
     prev_fps = 0  # Initialize previous FPS for smoothing
+
+    output_dir = "./output_videos"
+    output_filename = "output_video.mp4"
+    output_path = os.path.abspath(os.path.join(output_dir, output_filename))
+    logging.info(f"Absolute output path: {output_path}")
+
+    # Create directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Initialize VideoWriter with codec testing
+    fourcc_options = ['mp4v', 'XVID', 'avc1', 'MJPG']  # List of codecs to try
+    out = None
+    for codec in fourcc_options:
+        fourcc = cv.VideoWriter_fourcc(*codec)
+        out = cv.VideoWriter(output_path, fourcc, frame_rate, (cap_width, cap_height))
+        if out.isOpened():
+            logging.info(f"VideoWriter initialized successfully with codec '{codec}' at {frame_rate} FPS. Writing to {output_path}.")
+            break
+        else:
+            logging.warning(f"Failed to initialize VideoWriter with codec '{codec}'. Trying next codec.")
+    else:
+        logging.error("Failed to initialize VideoWriter with all tested codecs. Exiting.")
+        sys.exit(1)
 
     window_name = 'Tracker Demo'
     cv.namedWindow(window_name)
@@ -479,10 +516,14 @@ def main():
                 logging.info("No frame received. Exiting main loop.")
                 break
 
-            # Calculate and display FPS using the draw_fps function
-            prev_time, prev_fps = draw_fps(frame, prev_time, prev_fps)
+            # Log actual frame size
+            logging.debug(f"Original frame size: {frame.shape[1]}x{frame.shape[0]}")
 
-            # debug_image = frame.copy()
+            # Ensure frame size matches VideoWriter's expected size
+            if frame.shape[1] != cap_width or frame.shape[0] != cap_height:
+                logging.warning(f"Frame size {frame.shape[1]}x{frame.shape[0]} does not match VideoWriter size {cap_width}x{cap_height}. Resizing frame.")
+                frame = cv.resize(frame, (cap_width, cap_height))
+                logging.debug(f"Resized frame to: {frame.shape[1]}x{frame.shape[0]}")
 
             # Put frame into detection queue
             if not frame_queue.full():
@@ -500,14 +541,23 @@ def main():
             except queue.Empty:
                 pass
 
-            # Scale frame for tracking
-            scaled_frame = cv.resize(frame, None, fx=scale_factor, fy=scale_factor, interpolation=cv.INTER_LINEAR)
+            # Scale frame for tracking (use a copy to avoid modifying the original frame)
+            scaled_frame = cv.resize(frame, None, fx=args.scale_factor, fy=args.scale_factor, interpolation=cv.INTER_LINEAR)
+            logging.debug(f"Scaled frame size for tracking: {scaled_frame.shape[1]}x{scaled_frame.shape[0]}")
 
             # Update trackers
             trackers = tracker_manager.update_trackers(scaled_frame)
+            logging.debug(f"Updated {len(trackers)} trackers.")
 
-            # Process tracking results using the new function
-            process_tracking_results(trackers, frame, tracker_manager, color_list, scale_factor)
+            # Process tracking results
+            process_tracking_results(trackers, frame, tracker_manager, color_list, args.scale_factor)
+
+            # Validate frame before writing
+            if frame is not None:
+                out.write(frame)
+                logging.debug("Frame written to output video.")
+            else:
+                logging.error("Empty frame received; skipping writing.")
 
             # Display the frame
             cv.imshow(window_name, frame)
@@ -527,6 +577,11 @@ def main():
         stop_event.set()
         detector.join(timeout=2)
         cap.release()
+        if out is not None and out.isOpened():
+            out.release()  # Release the VideoWriter
+            logging.info(f"VideoWriter released successfully. Video saved to {output_path}.")
+        else:
+            logging.warning("VideoWriter was not opened or already released.")
         cv.destroyAllWindows()
         logging.info("Resources released and program terminated gracefully.")
 
